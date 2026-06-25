@@ -88,7 +88,15 @@ function Expand-QlikRecords {
         record, passes straight through untouched.
     #>
     param($Response)
+    # Invoke-RestMethod returns $null when QRS matches zero records. Wrapping
+    # $null with @() produces a 1-ELEMENT array containing $null (PowerShell's
+    # array-subexpression operator treats $null as "one output object", not
+    # "no output"), which would otherwise fall through and get expanded into a
+    # single blank/garbage record below. Catch that here so "zero matches"
+    # really means zero matches.
+    if ($null -eq $Response) { return @() }
     $items = @($Response)
+    if ($items.Count -eq 0) { return $items }
     if ($items.Count -ne 1 -or $null -eq $items[0]) { return $items }
     $obj = $items[0]
     if (-not ($obj.id -is [System.Array])) { return $items }   # genuine single record
@@ -164,6 +172,99 @@ function Get-QlikPrivateContent {
     }
 }
 
+function Get-QlikUsers {
+    <#
+        All users known to the Repository, with the flags needed to tell a
+        live account from a stale one:
+          - removedExternally : the directory connector (AD/etc.) no longer
+                                 returns this account, but QRS kept the record.
+          - blacklisted       : disabled/blacklisted in QRS.
+        Either flag means the account can no longer log in, so any private
+        content it still owns is effectively unreachable by its owner.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Server,
+        [Parameter(Mandatory)]$Certificate,
+        [string]$AdminUserDirectory = 'INTERNAL',
+        [string]$AdminUserId        = 'sa_repository'
+    )
+    $users = Expand-QlikRecords (Invoke-QlikQrs -Server $Server -Path 'user/full' -Certificate $Certificate `
+                -AdminUserDirectory $AdminUserDirectory -AdminUserId $AdminUserId)
+    foreach ($u in $users) {
+        [pscustomobject]@{
+            UserDirectory     = [string]$u.userDirectory
+            UserId            = [string]$u.userId
+            Name              = [string]$u.name
+            RemovedExternally = [bool]$u.removedExternally
+            Blacklisted       = [bool]$u.blacklisted
+        }
+    }
+}
+
+function Get-QlikOrphanedPrivateContent {
+    <#
+        Private sheets/bookmarks for one app whose owner can no longer act on
+        them - either because the App.Object has no owner reference at all,
+        or because the owner account has been removed from its directory or
+        blacklisted in QRS. These never get cleaned up by Get-QlikPrivateContent
+        date-window logic if the object happens to be old, and the person who
+        'owns' them can no longer log in to delete them themselves.
+
+        Always ignores any date window - an orphan is an orphan regardless of
+        modifiedDate, so every private sheet/bookmark in the app is checked.
+
+        Returns the same shape as Get-QlikPrivateContent plus an OrphanReason:
+            'no-owner'          - object has no owner directory/id at all
+            'owner-removed'     - owner no longer exists in the User repository,
+                                   or was removed externally (deleted from the
+                                   source directory)
+            'owner-blacklisted' - owner exists but is blacklisted in QRS
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Server,
+        [Parameter(Mandatory)]$Certificate,
+        [Parameter(Mandatory)][string]$AppId,
+        [string]$AdminUserDirectory = 'INTERNAL',
+        [string]$AdminUserId        = 'sa_repository'
+    )
+    $allPrivate = Get-QlikPrivateContent -Server $Server -Certificate $Certificate -AppId $AppId -Days 0 `
+                    -AdminUserDirectory $AdminUserDirectory -AdminUserId $AdminUserId
+    $users = Get-QlikUsers -Server $Server -Certificate $Certificate `
+                -AdminUserDirectory $AdminUserDirectory -AdminUserId $AdminUserId
+
+    # Map "directory\id" -> user record, for live (non-removed, non-blacklisted)
+    # accounts only. Anything not in here is no longer a usable owner.
+    $liveUsers = @{}
+    foreach ($u in $users) {
+        if (-not $u.RemovedExternally -and -not $u.Blacklisted) {
+            $liveUsers["$($u.UserDirectory)\$($u.UserId)"] = $u
+        }
+    }
+    # Separate lookup so we can tell "missing entirely" apart from "exists but blacklisted".
+    $anyUsers = @{}
+    foreach ($u in $users) { $anyUsers["$($u.UserDirectory)\$($u.UserId)"] = $u }
+
+    foreach ($o in $allPrivate) {
+        $hasOwner = -not [string]::IsNullOrWhiteSpace($o.ownerUserId)
+        $key      = "$($o.ownerUserDirectory)\$($o.ownerUserId)"
+
+        $reason = $null
+        if (-not $hasOwner) {
+            $reason = 'no-owner'
+        } elseif (-not $liveUsers.ContainsKey($key)) {
+            $reason = if ($anyUsers.ContainsKey($key) -and $anyUsers[$key].Blacklisted) {
+                'owner-blacklisted'
+            } else {
+                'owner-removed'
+            }
+        }
+
+        if ($reason) {
+            $o | Add-Member -NotePropertyName OrphanReason -NotePropertyValue $reason -PassThru
+        }
+    }
+}
+
 function Remove-QlikPrivateContentQrs {
     <# Owner-agnostic metadata deletion via QRS. #>
     param(
@@ -211,4 +312,5 @@ function Remove-QlikPrivateContentEngine {
 }
 
 Export-ModuleMember -Function New-QlikXrf, Get-QlikHost, Get-QlikClientCertificate, Invoke-QlikQrs,
-    Get-QlikApps, Get-QlikPrivateContent, Remove-QlikPrivateContentQrs, Remove-QlikPrivateContentEngine
+    Get-QlikApps, Get-QlikPrivateContent, Get-QlikUsers, Get-QlikOrphanedPrivateContent,
+    Remove-QlikPrivateContentQrs, Remove-QlikPrivateContentEngine

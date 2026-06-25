@@ -81,7 +81,11 @@ const cert = readCert('client.pem');
 const key = readCert('client_key.pem');
 
 // ------------------------------ manifest ----------------------------------
-const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+let manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+// PowerShell's ConvertTo-Json collapses a single-item array into a bare {...}
+// unless the caller passed -AsArray. Tolerate that here instead of silently
+// treating a lone object (the common shape for a single orphan) as "empty".
+if (manifest && !Array.isArray(manifest)) manifest = [manifest];
 if (!Array.isArray(manifest) || manifest.length === 0) {
   console.log('Manifest is empty - nothing to do.');
   fs.writeFileSync(resultsPath, JSON.stringify([], null, 2));
@@ -94,16 +98,30 @@ if (!manifest.every(o => o.appId === appId)) {
   process.exit(2);
 }
 
+// Orphans with no owner at all (deleted user, no owner reference left in QRS)
+// can't be impersonated in the engine - there's no identity to open the
+// session as. They're carried straight into the results as "skipped" so the
+// QRS metadata-delete stage downstream still picks them up.
+const noOwner = manifest.filter(o => !o.ownerUserId || !o.ownerUserDirectory);
+const withOwner = manifest.filter(o => o.ownerUserId && o.ownerUserDirectory);
+
+if (noOwner.length > 0) {
+  console.log(`Objects with no owner reference (cannot impersonate, engine delete skipped): ${noOwner.length}`);
+  for (const o of noOwner) {
+    console.log(`  [no-owner] ${o.objectType} ${o.engineObjectId} "${o.name || ''}" (orphan: ${o.OrphanReason || 'no-owner'})`);
+  }
+}
+
 // Group objects by owner (UserDirectory + UserId).
 const byOwner = new Map();
-for (const o of manifest) {
+for (const o of withOwner) {
   const k = `${o.ownerUserDirectory}\\${o.ownerUserId}`;
   if (!byOwner.has(k)) byOwner.set(k, []);
   byOwner.get(k).push(o);
 }
 
 console.log(`App:        ${appId}`);
-console.log(`Objects:    ${manifest.length}  (across ${byOwner.size} owner(s))`);
+console.log(`Objects:    ${manifest.length}  (${withOwner.length} across ${byOwner.size} owner(s), ${noOwner.length} ownerless orphan(s))`);
 console.log(`Mode:       ${execute ? 'EXECUTE (destructive)' : 'DRY RUN'}`);
 console.log('');
 
@@ -134,6 +152,11 @@ function openSessionAs(userDirectory, userId) {
 
 async function run() {
   const results = [];
+
+  for (const o of noOwner) {
+    console.log(`[skip] ${o.objectType} ${o.engineObjectId} "${o.name || ''}" - no owner to impersonate; QRS-only delete required`);
+    results.push({ ...o, action: 'skip-no-owner', success: null });
+  }
 
   for (const [ownerKey, objects] of byOwner) {
     const [userDirectory, userId] = ownerKey.split('\\');

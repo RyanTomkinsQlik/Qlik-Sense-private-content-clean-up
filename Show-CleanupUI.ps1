@@ -5,8 +5,14 @@
 .DESCRIPTION
     - Loads all apps (name + ID) from the Repository API so you can pick one.
     - Pick a deletion window: 30, 60, 90 or 120 days.
+    - Optionally include orphaned private content: sheets/bookmarks with no
+      owner reference, or whose owner has been removed from its directory or
+      blacklisted in QRS. These are found regardless of age, since the owner
+      can no longer log in to clean them up.
     - Preview (dry run) lists the private sheets/bookmarks that match.
     - Delete removes them via the Engine API (enigma.js) or QRS metadata.
+      Orphans with no owner at all can't be impersonated in the engine, so
+      those are cleaned up via QRS metadata delete only.
 
     Nothing is deleted until you click Delete and confirm.
 
@@ -43,9 +49,9 @@ $script:SelectedApp = $null
 # ======================= form scaffold ====================================
 $form                 = New-Object System.Windows.Forms.Form
 $form.Text            = 'Qlik - Delete recent private content'
-$form.Size            = New-Object System.Drawing.Size(900, 720)
+$form.Size            = New-Object System.Drawing.Size(900, 750)
 $form.StartPosition   = 'CenterScreen'
-$form.MinimumSize     = New-Object System.Drawing.Size(820, 640)
+$form.MinimumSize     = New-Object System.Drawing.Size(820, 670)
 
 function New-Label($text, $x, $y, $w = 110) {
     $l = New-Object System.Windows.Forms.Label
@@ -111,6 +117,13 @@ $rAll.Text = 'All'; $rAll.Location = (New-Object System.Drawing.Point((12 + 4 * 
 $rAll.Size = '64,22'; $rAll.Tag = 0
 $grpDays.Controls.Add($rAll); $radioDays[0] = $rAll
 
+# ---- orphaned content ------------------------------------------------------
+$chkOrphans = New-Object System.Windows.Forms.CheckBox
+$chkOrphans.Text = 'Include orphaned content (deleted/removed owners, any age)'
+$chkOrphans.Location = '12,448'; $chkOrphans.Size = '430,22'
+$chkOrphans.AutoSize = $false
+$form.Controls.Add($chkOrphans)
+
 # ---- method note (deletion always does both engine + QRS) ----------------
 $lblMethod = New-Object System.Windows.Forms.Label
 $lblMethod.Text = "Delete removes the content from" + [Environment]::NewLine + "both the Engine and the QRS catalog."
@@ -130,12 +143,12 @@ $btnDelete.ForeColor = [System.Drawing.Color]::DarkRed
 $form.Controls.Add($btnDelete)
 
 # ---- status + log --------------------------------------------------------
-$lblStatus = New-Label 'Load apps to begin.' 12 452 860
+$lblStatus = New-Label 'Load apps to begin.' 12 482 860
 $lblStatus.Font = New-Object System.Drawing.Font($lblStatus.Font, [System.Drawing.FontStyle]::Bold)
 $form.Controls.Add($lblStatus)
 
 $log = New-Object System.Windows.Forms.TextBox
-$log.Location = '12,478'; $log.Size = '860,190'
+$log.Location = '12,508'; $log.Size = '860,190'
 $log.Multiline = $true; $log.ScrollBars = 'Vertical'; $log.ReadOnly = $true
 $log.Font = New-Object System.Drawing.Font('Consolas', 9)
 $log.Anchor = 'Top,Bottom,Left,Right'
@@ -148,7 +161,7 @@ function Add-Log([string]$msg) {
 }
 function Set-Busy([bool]$busy) {
     $form.Cursor = if ($busy) { 'WaitCursor' } else { 'Default' }
-    foreach ($c in @($btnLoad, $btnPreview, $btnDelete, $txtServer, $txtCert)) { $c.Enabled = -not $busy }
+    foreach ($c in @($btnLoad, $btnPreview, $btnDelete, $txtServer, $txtCert, $chkOrphans)) { $c.Enabled = -not $busy }
     [System.Windows.Forms.Application]::DoEvents()
 }
 function Get-SelectedDays {
@@ -220,19 +233,40 @@ $btnPreview.Add_Click({
         $win  = Get-WindowText $days
         $cert = Get-CertOrThrow
         Add-Log "Preview: '$($script:SelectedApp.Name)' - private sheets/bookmarks updated within $win."
-        $script:Manifest = @(Get-QlikPrivateContent -Server $txtServer.Text.Trim() -Certificate $cert `
+        $dated = @(Get-QlikPrivateContent -Server $txtServer.Text.Trim() -Certificate $cert `
                               -AppId $script:SelectedApp.Id -Days $days `
                               -AdminUserDirectory $AdminUserDirectory -AdminUserId $AdminUserId)
+
+        $orphans = @()
+        if ($chkOrphans.Checked) {
+            Add-Log 'Scanning for orphaned content (no owner, or owner removed/blacklisted)...'
+            $orphans = @(Get-QlikOrphanedPrivateContent -Server $txtServer.Text.Trim() -Certificate $cert `
+                              -AppId $script:SelectedApp.Id `
+                              -AdminUserDirectory $AdminUserDirectory -AdminUserId $AdminUserId)
+            Add-Log "Orphan scan found $($orphans.Count) object(s)."
+        }
+
+        # Merge, de-duplicated by qrsId (an orphan inside the date window would
+        # otherwise show up twice).
+        $seen = @{}
+        $merged = @()
+        foreach ($m in ($dated + $orphans)) {
+            if (-not $seen.ContainsKey($m.qrsId)) { $seen[$m.qrsId] = $true; $merged += $m }
+        }
+        $script:Manifest = $merged
+
         if ($script:Manifest.Count -eq 0) {
-            $lblStatus.Text = "No matching private content ($win)."
+            $lblStatus.Text = "No matching private content ($win$(if ($chkOrphans.Checked) { ' + orphans' }))."
             Add-Log 'Nothing matched.'
             $btnDelete.Enabled = $false
         } else {
             foreach ($m in $script:Manifest) {
-                Add-Log ("  {0,-9} {1,-30} owner={2}\{3}  updated={4}" -f `
-                    $m.objectType, $m.name, $m.ownerUserDirectory, $m.ownerUserId, $m.modifiedDate)
+                $orphanTag = if ($m.OrphanReason) { " [orphan: $($m.OrphanReason)]" } else { '' }
+                Add-Log ("  {0,-9} {1,-30} owner={2}\{3}  updated={4}{5}" -f `
+                    $m.objectType, $m.name, $m.ownerUserDirectory, $m.ownerUserId, $m.modifiedDate, $orphanTag)
             }
-            $lblStatus.Text = "$($script:Manifest.Count) object(s) would be deleted ($win). Review the log, then Delete."
+            $orphanCount = @($script:Manifest | Where-Object { $_.OrphanReason }).Count
+            $lblStatus.Text = "$($script:Manifest.Count) object(s) would be deleted ($win$(if ($orphanCount -gt 0) { ", incl. $orphanCount orphan(s)" })). Review the log, then Delete."
             $btnDelete.Enabled = $true
         }
     } catch {
@@ -244,9 +278,11 @@ $btnDelete.Add_Click({
     if (-not $script:Manifest -or $script:Manifest.Count -eq 0) { return }
     $days   = Get-SelectedDays
     $win    = Get-WindowText $days
+    $orphanCount = @($script:Manifest | Where-Object { $_.OrphanReason }).Count
+    $orphanNote = if ($orphanCount -gt 0) { "`nIncludes $orphanCount orphaned object(s) (no owner, or owner removed/blacklisted) - those are removed via QRS metadata delete only, since there's no live owner to impersonate in the engine." } else { '' }
     $msg = "Delete $($script:Manifest.Count) private object(s) from`n" +
            "'$($script:SelectedApp.Name)'`n" +
-           "updated within $win, from both the engine and the QRS?`n`nThis cannot be undone."
+           "updated within $win, from both the engine and the QRS?$orphanNote`n`nThis cannot be undone."
     if ([System.Windows.Forms.MessageBox]::Show($msg, 'Confirm delete', 'YesNo', 'Warning') -ne 'Yes') {
         Add-Log 'Delete cancelled.'; return
     }
@@ -256,8 +292,13 @@ $btnDelete.Add_Click({
         $manifestPath = Join-Path $OutDir "objects-$stamp.json"
         $backupPath   = Join-Path $OutDir "backup-$stamp.json"
         $resultsPath  = Join-Path $OutDir "results-$stamp.json"
-        $script:Manifest | ConvertTo-Json -Depth 10 | Set-Content $manifestPath
-        $script:Manifest | ConvertTo-Json -Depth 10 | Set-Content $backupPath
+        # -AsArray matters here: piping a SINGLE object into ConvertTo-Json
+        # serializes a bare {...} instead of [{...}], and destroy-objects.cjs's
+        # Array.isArray() check would then treat that as "manifest is empty"
+        # and skip engine deletion entirely - exactly the case a lone orphan
+        # hits most often.
+        $script:Manifest | ConvertTo-Json -Depth 10 -AsArray | Set-Content $manifestPath
+        $script:Manifest | ConvertTo-Json -Depth 10 -AsArray | Set-Content $backupPath
         Add-Log "Manifest + backup written to $OutDir"
 
         $cert = Get-CertOrThrow
@@ -278,11 +319,13 @@ $btnDelete.Add_Click({
             -Log { param($m) Add-Log $m }
 
         Start-Sleep -Seconds 3   # allow engine->repository sync
-        $remaining = @(Get-QlikPrivateContent -Server $txtServer.Text.Trim() -Certificate $cert `
-                        -AppId $script:SelectedApp.Id -Days $days `
-                        -AdminUserDirectory $AdminUserDirectory -AdminUserId $AdminUserId)
-        $lblStatus.Text = "Done. $($remaining.Count) object(s) still match (expect 0)."
-        Add-Log "Verification: $($remaining.Count) remaining."
+        $deletedIds = @($script:Manifest | ForEach-Object { $_.qrsId })
+        $remaining  = @(Get-QlikPrivateContent -Server $txtServer.Text.Trim() -Certificate $cert `
+                        -AppId $script:SelectedApp.Id -Days 0 `
+                        -AdminUserDirectory $AdminUserDirectory -AdminUserId $AdminUserId |
+                        Where-Object { $_.qrsId -in $deletedIds })
+        $lblStatus.Text = "Done. $($remaining.Count) of $($script:Manifest.Count) targeted object(s) still remain (expect 0)."
+        Add-Log "Verification: $($remaining.Count) of $($script:Manifest.Count) targeted object(s) remaining."
         $btnDelete.Enabled = $false
         $script:Manifest = @()
     } catch {
