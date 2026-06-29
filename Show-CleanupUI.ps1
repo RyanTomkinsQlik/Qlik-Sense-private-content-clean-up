@@ -9,6 +9,11 @@
       owner reference, or whose owner has been removed from its directory or
       blacklisted in QRS. These are found regardless of age, since the owner
       can no longer log in to clean them up.
+    - Optionally protect specific owners: enter one or more DOMAIN\user
+      entries (exact UserDirectory\UserId match) and their private content is
+      excluded from the dated scan and kept. Note this protects only the
+      normal date-window results; orphaned content owned by a protected user
+      is still deleted, since an orphaned owner is gone/blocked anyway.
     - Preview (dry run) lists the private sheets/bookmarks that match.
     - Delete removes them via the Engine API (enigma.js) or QRS metadata.
       Orphans with no owner at all can't be impersonated in the engine, so
@@ -49,9 +54,9 @@ $script:SelectedApp = $null
 # ======================= form scaffold ====================================
 $form                 = New-Object System.Windows.Forms.Form
 $form.Text            = 'Qlik - Delete recent private content'
-$form.Size            = New-Object System.Drawing.Size(900, 750)
+$form.Size            = New-Object System.Drawing.Size(900, 812)
 $form.StartPosition   = 'CenterScreen'
-$form.MinimumSize     = New-Object System.Drawing.Size(820, 670)
+$form.MinimumSize     = New-Object System.Drawing.Size(820, 732)
 
 function New-Label($text, $x, $y, $w = 110) {
     $l = New-Object System.Windows.Forms.Label
@@ -109,12 +114,14 @@ foreach ($d in 30, 60, 90, 120) {
     $r.Text = "$d days"; $r.Location = (New-Object System.Drawing.Point((12 + $i * 78), 25))
     $r.Size = '74,22'; $r.Tag = $d
     if ($d -eq 90) { $r.Checked = $true }
+    $r.Add_CheckedChanged({ $btnDelete.Enabled = $false })
     $grpDays.Controls.Add($r); $radioDays[$d] = $r; $i++
 }
 # "All" - ignore the last-updated date and target every private sheet/bookmark.
 $rAll = New-Object System.Windows.Forms.RadioButton
 $rAll.Text = 'All'; $rAll.Location = (New-Object System.Drawing.Point((12 + 4 * 78), 25))
 $rAll.Size = '64,22'; $rAll.Tag = 0
+$rAll.Add_CheckedChanged({ $btnDelete.Enabled = $false })
 $grpDays.Controls.Add($rAll); $radioDays[0] = $rAll
 
 # ---- orphaned content ------------------------------------------------------
@@ -123,6 +130,21 @@ $chkOrphans.Text = 'Include orphaned content (deleted/removed owners, any age)'
 $chkOrphans.Location = '12,448'; $chkOrphans.Size = '430,22'
 $chkOrphans.AutoSize = $false
 $form.Controls.Add($chkOrphans)
+
+# ---- protected users (exclude their private content from deletion) --------
+# Exact match on UserDirectory\UserId. One entry per line, or separated by ';'.
+# Applies to the dated scan only - orphaned content is still deleted even if
+# owned by a protected user, since an orphaned owner is gone/blocked anyway.
+$lblProtect = New-Object System.Windows.Forms.Label
+$lblProtect.Text = "Protect these owners (DOMAIN\user, one per line or ';'-separated) - their private content is kept:"
+$lblProtect.Location = '12,474'; $lblProtect.Size = '860,18'
+$form.Controls.Add($lblProtect)
+
+$txtProtect = New-Object System.Windows.Forms.TextBox
+$txtProtect.Location = '12,494'; $txtProtect.Size = '860,44'
+$txtProtect.Multiline = $true; $txtProtect.ScrollBars = 'Vertical'
+$txtProtect.Anchor = 'Top,Left,Right'
+$form.Controls.Add($txtProtect)
 
 # ---- method note (deletion always does both engine + QRS) ----------------
 $lblMethod = New-Object System.Windows.Forms.Label
@@ -143,12 +165,12 @@ $btnDelete.ForeColor = [System.Drawing.Color]::DarkRed
 $form.Controls.Add($btnDelete)
 
 # ---- status + log --------------------------------------------------------
-$lblStatus = New-Label 'Load apps to begin.' 12 482 860
+$lblStatus = New-Label 'Load apps to begin.' 12 544 860
 $lblStatus.Font = New-Object System.Drawing.Font($lblStatus.Font, [System.Drawing.FontStyle]::Bold)
 $form.Controls.Add($lblStatus)
 
 $log = New-Object System.Windows.Forms.TextBox
-$log.Location = '12,508'; $log.Size = '860,190'
+$log.Location = '12,570'; $log.Size = '860,190'
 $log.Multiline = $true; $log.ScrollBars = 'Vertical'; $log.ReadOnly = $true
 $log.Font = New-Object System.Drawing.Font('Consolas', 9)
 $log.Anchor = 'Top,Bottom,Left,Right'
@@ -161,7 +183,7 @@ function Add-Log([string]$msg) {
 }
 function Set-Busy([bool]$busy) {
     $form.Cursor = if ($busy) { 'WaitCursor' } else { 'Default' }
-    foreach ($c in @($btnLoad, $btnPreview, $btnDelete, $txtServer, $txtCert, $chkOrphans)) { $c.Enabled = -not $busy }
+    foreach ($c in @($btnLoad, $btnPreview, $btnDelete, $txtServer, $txtCert, $chkOrphans, $txtProtect)) { $c.Enabled = -not $busy }
     [System.Windows.Forms.Application]::DoEvents()
 }
 function Get-SelectedDays {
@@ -214,6 +236,12 @@ $btnLoad.Add_Click({
 
 $txtFilter.Add_TextChanged({ Update-AppList })
 
+# Any change that affects what Preview would produce must force a re-Preview
+# before Delete is allowed, so the manifest can never be out of sync with the
+# current settings (e.g. editing protected owners after previewing).
+$txtProtect.Add_TextChanged({ $btnDelete.Enabled = $false })
+$chkOrphans.Add_CheckedChanged({ $btnDelete.Enabled = $false })
+
 $lst.Add_SelectedIndexChanged({
     if ($lst.SelectedItems.Count -gt 0) {
         $script:SelectedApp = $lst.SelectedItems[0].Tag
@@ -236,6 +264,27 @@ $btnPreview.Add_Click({
         $dated = @(Get-QlikPrivateContent -Server $txtServer.Text.Trim() -Certificate $cert `
                               -AppId $script:SelectedApp.Id -Days $days `
                               -AdminUserDirectory $AdminUserDirectory -AdminUserId $AdminUserId)
+
+        # Protected owners: exact UserDirectory\UserId match, case-insensitive.
+        # Split on newlines and semicolons, trim, drop blanks. Applied to the
+        # DATED scan only - orphaned content is still deleted even if owned by a
+        # protected user (an orphaned owner is gone/blocked, so "protect their
+        # active work" doesn't apply).
+        $protectKeys = @{}
+        foreach ($line in ($txtProtect.Text -split "[`r`n;]")) {
+            $entry = $line.Trim()
+            if ($entry) { $protectKeys[$entry.ToLowerInvariant()] = $true }
+        }
+        if ($protectKeys.Count -gt 0) {
+            $before = $dated.Count
+            $dated = @($dated | Where-Object {
+                $key = ("{0}\{1}" -f $_.ownerUserDirectory, $_.ownerUserId).ToLowerInvariant()
+                -not $protectKeys.ContainsKey($key)
+            })
+            $kept = $before - $dated.Count
+            Add-Log ("Protected owners: {0} entr{1} -> excluded {2} dated object(s) from deletion." -f `
+                $protectKeys.Count, $(if ($protectKeys.Count -eq 1) { 'y' } else { 'ies' }), $kept)
+        }
 
         $orphans = @()
         if ($chkOrphans.Checked) {
@@ -266,7 +315,8 @@ $btnPreview.Add_Click({
                     $m.objectType, $m.name, $m.ownerUserDirectory, $m.ownerUserId, $m.modifiedDate, $orphanTag)
             }
             $orphanCount = @($script:Manifest | Where-Object { $_.OrphanReason }).Count
-            $lblStatus.Text = "$($script:Manifest.Count) object(s) would be deleted ($win$(if ($orphanCount -gt 0) { ", incl. $orphanCount orphan(s)" })). Review the log, then Delete."
+            $protNote = if ($protectKeys.Count -gt 0) { " ($($protectKeys.Count) owner(s) protected)" } else { '' }
+            $lblStatus.Text = "$($script:Manifest.Count) object(s) would be deleted ($win$(if ($orphanCount -gt 0) { ", incl. $orphanCount orphan(s)" }))$protNote. Review the log, then Delete."
             $btnDelete.Enabled = $true
         }
     } catch {
