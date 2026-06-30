@@ -14,6 +14,13 @@
       excluded from the dated scan and kept. Note this protects only the
       normal date-window results; orphaned content owned by a protected user
       is still deleted, since an orphaned owner is gone/blocked anyway.
+    - Optionally set a section-access override identity: when an app uses
+      section access, opening it as the original owner can yield a reduced or
+      blocked session that refuses the engine-side delete (while the QRS row
+      still gets removed - leaving the object orphaned in the file). Enter a
+      DOMAIN\user that has ADMIN in the section access table, and ALL engine
+      deletions run as that one account so the session opens unreduced. Leave
+      blank for the default per-owner behaviour.
     - Preview (dry run) lists the private sheets/bookmarks that match.
     - Delete removes them via the Engine API (enigma.js) or QRS metadata.
       Orphans with no owner at all can't be impersonated in the engine, so
@@ -54,9 +61,9 @@ $script:SelectedApp = $null
 # ======================= form scaffold ====================================
 $form                 = New-Object System.Windows.Forms.Form
 $form.Text            = 'Qlik - Delete recent private content'
-$form.Size            = New-Object System.Drawing.Size(900, 812)
+$form.Size            = New-Object System.Drawing.Size(900, 858)
 $form.StartPosition   = 'CenterScreen'
-$form.MinimumSize     = New-Object System.Drawing.Size(820, 732)
+$form.MinimumSize     = New-Object System.Drawing.Size(820, 778)
 
 function New-Label($text, $x, $y, $w = 110) {
     $l = New-Object System.Windows.Forms.Label
@@ -146,6 +153,21 @@ $txtProtect.Multiline = $true; $txtProtect.ScrollBars = 'Vertical'
 $txtProtect.Anchor = 'Top,Left,Right'
 $form.Controls.Add($txtProtect)
 
+# ---- section-access override identity -------------------------------------
+# When set, ALL engine deletions run as this one identity instead of each
+# object's owner. Required for section-access apps: supply a service account
+# listed with ADMIN in the section access table so the engine opens an
+# unreduced session and destroyObject/doSave succeed. Leave blank to keep the
+# default per-owner impersonation.
+$lblOverride = New-Object System.Windows.Forms.Label
+$lblOverride.Text = "Section-access override (DOMAIN\user) - run ALL engine deletes as this account (blank = per-owner):"
+$lblOverride.Location = '12,544'; $lblOverride.Size = '860,18'
+$form.Controls.Add($lblOverride)
+
+$txtOverride = New-Text '' 12 564 860
+$txtOverride.Anchor = 'Top,Left,Right'
+$form.Controls.Add($txtOverride)
+
 # ---- method note (deletion always does both engine + QRS) ----------------
 $lblMethod = New-Object System.Windows.Forms.Label
 $lblMethod.Text = "Delete removes the content from" + [Environment]::NewLine + "both the Engine and the QRS catalog."
@@ -165,12 +187,12 @@ $btnDelete.ForeColor = [System.Drawing.Color]::DarkRed
 $form.Controls.Add($btnDelete)
 
 # ---- status + log --------------------------------------------------------
-$lblStatus = New-Label 'Load apps to begin.' 12 544 860
+$lblStatus = New-Label 'Load apps to begin.' 12 592 860
 $lblStatus.Font = New-Object System.Drawing.Font($lblStatus.Font, [System.Drawing.FontStyle]::Bold)
 $form.Controls.Add($lblStatus)
 
 $log = New-Object System.Windows.Forms.TextBox
-$log.Location = '12,570'; $log.Size = '860,190'
+$log.Location = '12,618'; $log.Size = '860,190'
 $log.Multiline = $true; $log.ScrollBars = 'Vertical'; $log.ReadOnly = $true
 $log.Font = New-Object System.Drawing.Font('Consolas', 9)
 $log.Anchor = 'Top,Bottom,Left,Right'
@@ -183,7 +205,7 @@ function Add-Log([string]$msg) {
 }
 function Set-Busy([bool]$busy) {
     $form.Cursor = if ($busy) { 'WaitCursor' } else { 'Default' }
-    foreach ($c in @($btnLoad, $btnPreview, $btnDelete, $txtServer, $txtCert, $chkOrphans, $txtProtect)) { $c.Enabled = -not $busy }
+    foreach ($c in @($btnLoad, $btnPreview, $btnDelete, $txtServer, $txtCert, $chkOrphans, $txtProtect, $txtOverride)) { $c.Enabled = -not $busy }
     [System.Windows.Forms.Application]::DoEvents()
 }
 function Get-SelectedDays {
@@ -357,9 +379,11 @@ $btnDelete.Add_Click({
         # at preview time, so each stage works from the manifest and never has to
         # re-find an item the other stage already deleted.
         Add-Log 'Deleting via Engine API (enigma.js)...'
+        $override = $txtOverride.Text.Trim()
+        if ($override) { Add-Log "Engine deletions will run as override identity: $override (section-access mode)." }
         Remove-QlikPrivateContentEngine -Server $txtServer.Text.Trim() -CertDir $txtCert.Text.Trim() `
             -ManifestPath $manifestPath -ResultsPath $resultsPath -DestroyScript $DestroyScript `
-            -Schema $EngineSchema -Log { param($m) Add-Log $m }
+            -Schema $EngineSchema -OverrideUser $override -Log { param($m) Add-Log $m }
 
         # QRS second: removes the catalog entry. If the engine sync already
         # cleared it, the delete returns 404 and is reported as "already removed".

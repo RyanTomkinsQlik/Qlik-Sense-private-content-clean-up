@@ -49,6 +49,13 @@ const schemaVer = getArg('schema', '12.612.0');
 const execute = getArg('execute', false) === true;
 const resultsPath = getArg('results', 'engine-delete-results.json');
 const enginePort = getArg('port', '4747');
+// Optional: force ALL engine deletions to run as one identity instead of
+// impersonating each object's owner. Needed for section-access apps, where
+// opening as the original owner yields a reduced/blocked session that refuses
+// destroyObject/doSave. Supply a service account that is listed with ADMIN in
+// the app's section access table so it opens an unreduced session.
+// Format: "UserDirectory\UserId" (e.g. "WIN-1HM052T9OAT\Qlik_Svc").
+const overrideUser = getArg('override-user', null);
 
 if (!host || !certDir) {
   console.error('ERROR: --host and --certs are required.');
@@ -99,11 +106,29 @@ if (!manifest.every(o => o.appId === appId)) {
 }
 
 // Orphans with no owner at all (deleted user, no owner reference left in QRS)
-// can't be impersonated in the engine - there's no identity to open the
-// session as. They're carried straight into the results as "skipped" so the
-// QRS metadata-delete stage downstream still picks them up.
-const noOwner = manifest.filter(o => !o.ownerUserId || !o.ownerUserDirectory);
-const withOwner = manifest.filter(o => o.ownerUserId && o.ownerUserDirectory);
+// normally can't be impersonated in the engine - there's no identity to open
+// the session as, so they're skipped here and left for the QRS metadata-delete
+// stage. BUT if an override user is supplied, we DO have a working identity, so
+// even these can be destroyed in the engine under the override account.
+const overrideParts = overrideUser ? splitIdentity(overrideUser) : null;
+
+let noOwner, withOwner;
+if (overrideParts) {
+  // Everything is deletable under the override identity.
+  noOwner = [];
+  withOwner = manifest.slice();
+} else {
+  noOwner = manifest.filter(o => !o.ownerUserId || !o.ownerUserDirectory);
+  withOwner = manifest.filter(o => o.ownerUserId && o.ownerUserDirectory);
+}
+
+function splitIdentity(s) {
+  // Split only on the FIRST backslash - a UserId could itself be empty but a
+  // UserDirectory like "WIN-1HM052T9OAT" won't contain one in practice.
+  const idx = s.indexOf('\\');
+  if (idx === -1) return { userDirectory: '', userId: s };
+  return { userDirectory: s.slice(0, idx), userId: s.slice(idx + 1) };
+}
 
 if (noOwner.length > 0) {
   console.log(`Objects with no owner reference (cannot impersonate, engine delete skipped): ${noOwner.length}`);
@@ -112,12 +137,19 @@ if (noOwner.length > 0) {
   }
 }
 
-// Group objects by owner (UserDirectory + UserId).
+// Group objects by the identity we'll OPEN AS. With an override user that's a
+// single group for everything; otherwise it's one group per object owner.
 const byOwner = new Map();
-for (const o of withOwner) {
-  const k = `${o.ownerUserDirectory}\\${o.ownerUserId}`;
-  if (!byOwner.has(k)) byOwner.set(k, []);
-  byOwner.get(k).push(o);
+if (overrideParts) {
+  const k = `${overrideParts.userDirectory}\\${overrideParts.userId}`;
+  byOwner.set(k, withOwner.slice());
+  console.log(`Override identity in effect: all ${withOwner.length} object(s) will be opened as ${k} (section-access mode).`);
+} else {
+  for (const o of withOwner) {
+    const k = `${o.ownerUserDirectory}\\${o.ownerUserId}`;
+    if (!byOwner.has(k)) byOwner.set(k, []);
+    byOwner.get(k).push(o);
+  }
 }
 
 console.log(`App:        ${appId}`);
@@ -159,8 +191,8 @@ async function run() {
   }
 
   for (const [ownerKey, objects] of byOwner) {
-    const [userDirectory, userId] = ownerKey.split('\\');
-    console.log(`Owner ${ownerKey}: ${objects.length} object(s)`);
+    const { userDirectory, userId } = splitIdentity(ownerKey);
+    console.log(`Opening as ${ownerKey}: ${objects.length} object(s)`);
 
     if (!execute) {
       for (const o of objects) {

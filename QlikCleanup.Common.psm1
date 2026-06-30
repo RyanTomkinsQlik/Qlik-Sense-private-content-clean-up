@@ -295,7 +295,11 @@ function Remove-QlikPrivateContentQrs {
 }
 
 function Remove-QlikPrivateContentEngine {
-    <# Engine API deletion via enigma.js (destroy-objects.cjs), streamed to $Log. #>
+    <# Engine API deletion via enigma.js (destroy-objects.cjs), streamed to $Log.
+       If -OverrideUser is set (UserDirectory\UserId), ALL objects are deleted
+       under that single identity instead of impersonating each owner. Use this
+       for section-access apps, supplying a service account that has ADMIN in
+       the section access table so the engine opens an unreduced session. #>
     param(
         [Parameter(Mandatory)][string]$Server,
         [Parameter(Mandatory)][string]$CertDir,
@@ -303,12 +307,16 @@ function Remove-QlikPrivateContentEngine {
         [Parameter(Mandatory)][string]$ResultsPath,
         [Parameter(Mandatory)][string]$DestroyScript,
         [string]$Schema = '12.612.0',
+        [string]$OverrideUser = '',
         [scriptblock]$Log = { param($m) Write-Host $m }
     )
     $node = (Get-Command node -ErrorAction Stop).Source
-    & $node $DestroyScript --manifest $ManifestPath --host $Server --certs $CertDir `
-        --schema $Schema --results $ResultsPath --execute 2>&1 |
-        ForEach-Object { & $Log ([string]$_) }
+    $args = @($DestroyScript, '--manifest', $ManifestPath, '--host', $Server,
+              '--certs', $CertDir, '--schema', $Schema, '--results', $ResultsPath, '--execute')
+    if (-not [string]::IsNullOrWhiteSpace($OverrideUser)) {
+        $args += @('--override-user', $OverrideUser)
+    }
+    & $node @args 2>&1 | ForEach-Object { & $Log ([string]$_) }
 }
 
 Export-ModuleMember -Function New-QlikXrf, Get-QlikHost, Get-QlikClientCertificate, Invoke-QlikQrs,
