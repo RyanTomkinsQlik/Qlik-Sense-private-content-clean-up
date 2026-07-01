@@ -43,7 +43,7 @@ function getArg(name, fallback = undefined) {
 }
 
 const manifestPath = getArg('manifest', 'objects-to-delete.json');
-const host = getArg('host');
+let host = getArg('host');
 const certDir = getArg('certs');
 const schemaVer = getArg('schema', '12.612.0');
 const execute = getArg('execute', false) === true;
@@ -59,6 +59,20 @@ const overrideUser = getArg('override-user', null);
 
 if (!host || !certDir) {
   console.error('ERROR: --host and --certs are required.');
+  process.exit(2);
+}
+
+// Normalize the host so the wss URL is always well-formed. If the server was
+// entered with a scheme (https://server, wss://server) or a trailing path,
+// building `wss://${host}:4747/...` would produce `wss://https://server...`
+// and Node fails with "getaddrinfo ENOTFOUND https". Strip scheme, any path,
+// any embedded port, and surrounding whitespace/slashes down to a bare host.
+host = String(host).trim()
+  .replace(/^[a-z]+:\/\//i, '')  // drop leading scheme://
+  .replace(/\/.*$/, '')          // drop anything from the first slash onward
+  .replace(/:\d+$/, '');         // drop an embedded :port (we add enginePort)
+if (!host) {
+  console.error('ERROR: --host resolved to empty after normalization.');
   process.exit(2);
 }
 
@@ -212,7 +226,16 @@ async function run() {
       console.error(`  ! could not open app as ${ownerKey}: ${err.message}`);
       for (const o of objects) results.push({ ...o, action: 'destroy', success: false, error: `open failed: ${err.message}` });
       try { if (session) await session.close(); } catch (_) {}
-      continue;
+      // A failed open is fatal: no objects in this group can be deleted, and
+      // continuing (or letting the caller proceed to the QRS metadata delete)
+      // would strip catalog rows for objects still physically in the app -
+      // the exact "deleted in QRS, not in engine" split we must avoid. Abort
+      // now with a distinct exit code so the caller skips the QRS stage.
+      fs.writeFileSync(resultsPath, JSON.stringify(results, null, 2));
+      console.log('');
+      console.error(`ABORTED: could not open the app (${ownerKey}). No engine deletions were performed. ` +
+        `Skipping remaining work so QRS metadata is NOT deleted for objects still in the app.`);
+      process.exit(3);   // 3 = could-not-open / aborted before deleting
     }
 
     for (const o of objects) {

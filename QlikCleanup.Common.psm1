@@ -317,6 +317,11 @@ function Remove-QlikPrivateContentEngine {
         $args += @('--override-user', $OverrideUser)
     }
     & $node @args 2>&1 | ForEach-Object { & $Log ([string]$_) }
+    # Surface the engine script's exit code so the caller can decide whether the
+    # QRS metadata-delete stage is safe to run:
+    #   0 = success, 1 = some per-object destroy failures, 3 = could not open app
+    #   (nothing deleted - QRS stage MUST be skipped to avoid orphaning objects).
+    return $LASTEXITCODE
 }
 
 Export-ModuleMember -Function New-QlikXrf, Get-QlikHost, Get-QlikClientCertificate, Invoke-QlikQrs,

@@ -381,9 +381,34 @@ $btnDelete.Add_Click({
         Add-Log 'Deleting via Engine API (enigma.js)...'
         $override = $txtOverride.Text.Trim()
         if ($override) { Add-Log "Engine deletions will run as override identity: $override (section-access mode)." }
-        Remove-QlikPrivateContentEngine -Server $txtServer.Text.Trim() -CertDir $txtCert.Text.Trim() `
+        $engineRet = Remove-QlikPrivateContentEngine -Server $txtServer.Text.Trim() -CertDir $txtCert.Text.Trim() `
             -ManifestPath $manifestPath -ResultsPath $resultsPath -DestroyScript $DestroyScript `
             -Schema $EngineSchema -OverrideUser $override -Log { param($m) Add-Log $m }
+        # The function streams log lines via Add-Log and returns the node exit
+        # code last; take the final integer in case anything else leaked onto
+        # the pipeline.
+        $engineExit = @($engineRet | Where-Object { $_ -is [int] })
+        $engineExit = if ($engineExit.Count) { $engineExit[-1] } else { 0 }
+
+        # If the engine could not open the app (exit 3), NOTHING was deleted in
+        # the engine. Running the QRS stage now would delete catalog rows for
+        # objects still physically in the app - orphaning them. Abort instead,
+        # leaving both the objects and their catalog rows intact so a re-run
+        # after fixing the connection is clean.
+        if ($engineExit -eq 3) {
+            $lblStatus.Text = 'Aborted: could not open the app in the engine. Nothing was deleted. Check the server name / override identity / certs and try again.'
+            Add-Log 'ABORTED before QRS stage: engine could not open the app, so no metadata was deleted. Nothing changed.'
+            [System.Windows.Forms.MessageBox]::Show(
+                "Could not open the app in the engine, so nothing was deleted." + [Environment]::NewLine + [Environment]::NewLine +
+                "The QRS metadata step was skipped on purpose, so no objects were orphaned." + [Environment]::NewLine +
+                "Check the Server value (bare hostname, no https://), the override identity, and the cert dir, then Preview and Delete again.",
+                'Engine open failed - nothing deleted', 'OK', 'Warning') | Out-Null
+            $btnDelete.Enabled = $true   # allow a retry after fixing the cause
+            return
+        }
+        if ($engineExit -ne 0) {
+            Add-Log "Engine stage reported partial failures (exit $engineExit). Proceeding to QRS only for objects that were destroyed; review the results file for details."
+        }
 
         # QRS second: removes the catalog entry. If the engine sync already
         # cleared it, the delete returns 404 and is reported as "already removed".
